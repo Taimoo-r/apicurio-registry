@@ -15,6 +15,8 @@ The point of the demo is step 6. Everything before it is table stakes.
 | A rejecting endpoint causes backoff, not a hot loop | gaps of 1s, 2s, 4s, 8s |
 | **Killing the registry mid-backoff does not lose the delivery** | **attempt 4 fires after restart, not attempt 1** |
 | Retries eventually succeed and are recorded | `status=DELIVERED, attemptCount=5, httpStatusCode=204` |
+| It works on PostgreSQL, not just H2 | same sequence with the database in a separate container |
+| Existing deployments get the tables | `db_version` 109 to 110 upgrade runs and preserves data |
 
 ## Recorded run
 
@@ -55,6 +57,51 @@ This is the specific thing `HttpClientService`'s `@Retry(maxRetries = 8) @Expone
 MicroProfile retry holds its state on the calling thread, so a `kill -9` loses every in-flight retry, and
 the requirement in [#8569](https://github.com/Apicurio/apicurio-registry/issues/8569) is at-least-once
 delivery with graceful shutdown.
+
+## Same run against PostgreSQL
+
+H2 alone is a weak demonstration, because the database lives inside the process being killed. Repeating it
+with PostgreSQL in a separate container removes that objection: the registry dies, the database does not.
+
+```
+14:30:28.150  REJECT 500   attempt=1   sig=valid   delivery e1934228
+14:30:30.009  REJECT 500   attempt=2   sig=valid   delivery e1934228
+14:30:33.010  REJECT 500   attempt=3   sig=valid   delivery e1934228
+14:30:38.425  REJECT 500   attempt=4   sig=valid   delivery e1934228
+14:30:39.927  *** registry killed, postgres container untouched ***
+14:31:12.142  ACCEPT 204   attempt=5   sig=valid   delivery e1934228
+```
+
+With no registry process alive, the queue state is visible directly in PostgreSQL:
+
+```
+    id    | status  | attemptcount |  nextretryat  | claimedby
+----------+---------+--------------+---------------+-----------
+ e1934228 | PENDING |            4 | 1786631446418 |
+```
+
+Pending, four attempts recorded, next attempt scheduled, claim released. Nothing about the outstanding
+delivery depends on the process that created it.
+
+## Migration from an existing deployment
+
+Adding tables in a base DDL only helps fresh installs. The upgrade path was tested separately by taking a
+populated database back to `db_version` 109, dropping the two tables, and restarting:
+
+```
+Checking to see if the DB is up-to-date.
+Build's DB version is 110
+Old database version detected, upgrading.
+	Database type: postgresql
+```
+
+Result: both tables created, `db_version` at 110, and the existing `artifacts` rows untouched. A delivery
+was then driven end to end on the migrated schema to confirm the upgrade produced a working schema rather
+than DDL that merely executed.
+
+Note for upstreaming: `db-version` 110 is currently contested. Three open PRs each claim `upgrades/110/`,
+so whichever lands first forces the others to renumber. Any schema change here needs that slot
+coordinated with the maintainers rather than assumed.
 
 ## Running it
 
